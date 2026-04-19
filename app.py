@@ -6,6 +6,8 @@ import numpy as np
 import cv2
 import os
 from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+import av
 
 # 1. Setup Models
 prototxtPath = os.path.sep.join(["face_detector", "deploy.prototxt"])
@@ -14,19 +16,16 @@ weightsPath = os.path.sep.join(
 faceNet = cv2.dnn.readNet(prototxtPath, weightsPath)
 model = load_model("mask_detector.h5")
 
+
 def detect_and_predict_mask(frame, faceNet, maskNet):
-    # Safety check: if frame is None, return empty lists
     if frame is None:
         return ([], [])
-
     (h, w) = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
     faceNet.setInput(blob)
     detections = faceNet.forward()
 
-    faces = []
-    locs = []
-    preds = []
+    faces, locs, preds = [], [], []
 
     for i in range(0, detections.shape[2]):
         confidence = detections[0, 0, i, 2]
@@ -37,8 +36,6 @@ def detect_and_predict_mask(frame, faceNet, maskNet):
             (endX, endY) = (min(w - 1, endX), min(h - 1, endY))
 
             face = frame[startY:endY, startX:endX]
-            
-            # Ensure the face crop is not empty
             if face is not None and face.size > 0:
                 face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
                 face = cv2.resize(face, (224, 224))
@@ -52,69 +49,80 @@ def detect_and_predict_mask(frame, faceNet, maskNet):
         preds = maskNet.predict(faces, batch_size=32)
     return (locs, preds)
 
-# --- STREAMLIT UI ---
-st.sidebar.title("Settings")
-choice = st.sidebar.selectbox(
-    "Select Mode", ("Webcam", "Upload Image", "Upload Video"))
+# 2. WebRTC Video Processor Class
 
-if choice == "Webcam":
-    st.title("Webcam Mask Detection")
-    st.info("Note: This takes a snapshot from your browser camera.")
-    
-    # Use Streamlit's built-in camera input for Cloud compatibility
-    img_file_buffer = st.camera_input("Take a picture")
 
-    if img_file_buffer is not None:
-        # To read image file buffer with PIL:
-        img = Image.open(img_file_buffer)
-        # Convert to numpy array (OpenCV format)
-        frame = np.array(img)
-        
-        # Detect and Predict
-        (locs, preds) = detect_and_predict_mask(frame, faceNet, model)
+class FaceMaskTransformer(VideoProcessorBase):
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
 
+        # Run detection
+        (locs, preds) = detect_and_predict_mask(img, faceNet, model)
+
+        # Draw boxes and labels
         for (box, pred) in zip(locs, preds):
             (startX, startY, endX, endY) = box
             (mask, withoutMask) = pred
             label = "Mask" if mask > withoutMask else "No Mask"
-            color = (0, 255, 0) if label == "Mask" else (255, 0, 0)
-            
-            cv2.putText(frame, label, (startX, startY - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+            color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
 
-        st.image(frame, caption="Processed Image", use_container_width=True)
+            cv2.putText(img, label, (startX, startY - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+            cv2.rectangle(img, (startX, startY), (endX, endY), color, 2)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+# --- STREAMLIT UI ---
+st.sidebar.title("Settings")
+choice = st.sidebar.selectbox(
+    "Select Mode", ("Webcam (Live)", "Upload Image", "Upload Video"))
+
+if choice == "Webcam (Live)":
+    st.title("Live Real-Time Mask Detection")
+    st.info("Click 'Start' to begin streaming. Boxes will move with your face.")
+
+    webrtc_streamer(
+        key="face-mask-detect",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=FaceMaskTransformer,
+        rtc_configuration={
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        },
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
 elif choice == "Upload Image":
-    st.title("Image Detection")
+    st.title("Static Image Detection")
     file = st.file_uploader("Upload an Image", type=['jpg', 'png', 'jpeg'])
     if file:
         image = Image.open(file)
         frame = np.array(image)
+        # Convert RGB (PIL) to BGR (OpenCV)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         (locs, preds) = detect_and_predict_mask(frame, faceNet, model)
 
         for (box, pred) in zip(locs, preds):
             (startX, startY, endX, endY) = box
             (mask, withoutMask) = pred
             label = "Mask" if mask > withoutMask else "No Mask"
-            color = (0, 255, 0) if label == "Mask" else (255, 0, 0)
+            color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
             cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
             cv2.putText(frame, label, (startX, startY - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        st.image(frame, use_container_width=True)
+        st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                 use_container_width=True)
 
 elif choice == "Upload Video":
     st.title("Video Detection")
-    st.info("Upload a short clip to process.")
     video_file = st.file_uploader("Upload Video", type=['mp4', 'mov', 'avi'])
     if video_file:
         with open("temp_video.mp4", "wb") as f:
             f.write(video_file.read())
-
         cap = cv2.VideoCapture("temp_video.mp4")
         st_frame = st.empty()
-
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -124,9 +132,7 @@ elif choice == "Upload Video":
                 (startX, startY, endX, endY) = box
                 (mask, withoutMask) = pred
                 label = "Mask" if mask > withoutMask else "No Mask"
-                color = (0, 255, 0) if label == "Mask" else (255, 0, 0)
+                color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
                 cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
-                cv2.putText(frame, label, (startX, startY - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             st_frame.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         cap.release()

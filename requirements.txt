@@ -1,4 +1,6 @@
 streamlit
+streamlit-webrtc
+av
 tensorflow-cpu
 opencv-python-headless
 imutils
