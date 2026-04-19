@@ -1,7 +1,7 @@
-streamlit
-streamlit-webrtc
-av
-tensorflow-cpu
+streamlit==1.56.0
+streamlit-webrtc==0.64.5
+av==16.1.0
+tensorflow-cpu==2.18.0
 opencv-python-headless
-numpy
+numpy<2.0.0
 Pillow
